@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install yq
+        run: |
+          set -Eeuo pipefail
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.47.1/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Validate composite action.yml structure
+        run: |
+          set -Eeuo pipefail
+          failed=0
+          for action in release-pr release-tag; do
+            file="${action}/action.yml"
+            echo "::group::${file}"
+            yq eval '.' "${file}" > /dev/null
+
+            using=$(yq eval '.runs.using // ""' "${file}")
+            if [ "${using}" != "composite" ]; then
+              echo "::error file=${file}::runs.using must be 'composite', got '${using}'"
+              failed=1
+            fi
+
+            for key in name description branding inputs outputs runs; do
+              val=$(yq eval ".${key} // \"\"" "${file}")
+              if [ -z "${val}" ] || [ "${val}" = "null" ]; then
+                echo "::error file=${file}::missing top-level key '${key}'"
+                failed=1
+              fi
+            done
+
+            icon=$(yq eval '.branding.icon // ""' "${file}")
+            color=$(yq eval '.branding.color // ""' "${file}")
+            if [ -z "${icon}" ] || [ -z "${color}" ]; then
+              echo "::error file=${file}::branding.icon and branding.color are required for Marketplace listing"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "${failed}"
+
+      - name: Run actionlint on workflows
+        uses: reviewdog/action-actionlint@v1
+        with:
+          reporter: github-pr-check
+          fail_level: any
+
+      - name: Extract shell blocks from action.yml files
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .shellcheck
+          for action in release-pr release-tag; do
+            file="${action}/action.yml"
+            {
+              echo '#!/usr/bin/env bash'
+              echo '# Concatenated shell blocks from '"${file}"' for shellcheck only.'
+              echo '# shellcheck disable=SC2154'
+              yq eval '.runs.steps[] | select(.shell == "bash") | .run' "${file}"
+            } > ".shellcheck/${action}.sh"
+            echo "Extracted ${action}.sh ($(wc -l < ".shellcheck/${action}.sh") lines)"
+          done
+
+      - name: Run shellcheck
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+          scripts=(.shellcheck/*.sh)
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "::error::No extracted shell scripts found — the Extract step must run first."
+            exit 1
+          fi
+          for script in "${scripts[@]}"; do
+            name=$(basename "${script}")
+            echo "::group::shellcheck ${name}"
+            docker run --rm \
+              -v "${GITHUB_WORKSPACE}/.shellcheck:/work" \
+              -w /work \
+              koalaman/shellcheck:stable \
+              --severity=warning --shell=bash "${name}"
+            echo "::endgroup::"
+          done
