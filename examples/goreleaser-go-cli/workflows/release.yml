@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+jobs:
+  release:
+    name: GoReleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.1
+
+      # Mint a scoped installation token for the Homebrew tap repo.
+      # Drop this step (and the HOMEBREW_TAP_GITHUB_TOKEN env var below)
+      # if you aren't publishing a Homebrew cask.
+      - name: Mint Homebrew app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: <<<REPLACE_WITH_ORG>>>
+          repositories: <<<REPLACE_WITH_TAP_REPO_NAME>>>
+          skip-token-revoke: false
+
+      # Defensive: skip Homebrew publishing if the app token can't reach the tap
+      # (first-run before the app is installed on the tap, or permissions drift).
+      - name: Determine GoReleaser args
+        id: goreleaser_args
+        shell: bash
+        env:
+          HOMEBREW_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAP_REPO: <<<REPLACE_WITH_ORG>>>/<<<REPLACE_WITH_TAP_REPO_NAME>>>
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${HOMEBREW_TOKEN}" ]; then
+            echo "args=release --clean --skip=homebrew" >> "$GITHUB_OUTPUT"
+            echo "::warning::GitHub App token was not minted; skipping Homebrew formula publish."
+            exit 0
+          fi
+          if curl --silent --show-error --fail \
+            --header "Authorization: Bearer ${HOMEBREW_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${TAP_REPO}" >/dev/null; then
+            echo "args=release --clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=release --clean --skip=homebrew" >> "$GITHUB_OUTPUT"
+            echo "::warning::GitHub App token cannot access ${TAP_REPO}; skipping Homebrew formula publish."
+          fi
+
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.15.2
+          args: ${{ steps.goreleaser_args.outputs.args }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: dist/checksums.txt
+      - name: Attest release metadata artifacts
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/checksums.txt
+            dist/*.sbom.json
+            dist/*.sigstore.json

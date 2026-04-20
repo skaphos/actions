@@ -1,0 +1,343 @@
+name: "Skaphos Release PR"
+description: "Open or update a release PR that bumps the version manifest based on Conventional Commits (via svu). One file changes per PR; verified commits via the GitHub Contents API."
+author: "Skaphos"
+branding:
+  icon: git-pull-request
+  color: blue
+
+inputs:
+  token:
+    description: "GitHub token with contents:write and pull-requests:write. Prefer a GitHub App installation token."
+    required: true
+  manifest-path:
+    description: "Path to the JSON manifest file that holds the version."
+    required: false
+    default: ".release-please-manifest.json"
+  manifest-key:
+    description: "JSON key inside the manifest (for monorepo support)."
+    required: false
+    default: "."
+  bump:
+    description: "One of auto, major, minor, patch. auto infers from Conventional Commits via svu."
+    required: false
+    default: "auto"
+  tag-prefix:
+    description: "Prefix prepended to the version when reading/writing tags."
+    required: false
+    default: "v"
+  branch-prefix:
+    description: "Prefix for the release PR branch name."
+    required: false
+    default: "release/v"
+  pr-label:
+    description: "Label applied to the release PR. Keep in sync with the release-tag trigger filter."
+    required: false
+    default: "release-pr"
+  pr-title-template:
+    description: "Template for the PR title. Variables: {{tag}}, {{version}}, {{manifest-key}}."
+    required: false
+    default: "chore(release): release {{tag}}"
+  pr-body-template:
+    description: "Template for the PR body. Empty string uses a built-in default that includes the commit list since the last tag."
+    required: false
+    default: ""
+  committer-name:
+    description: "Name for the API-created commit."
+    required: false
+    default: "github-actions[bot]"
+  committer-email:
+    description: "Email for the API-created commit."
+    required: false
+    default: "41898282+github-actions[bot]@users.noreply.github.com"
+  svu-version:
+    description: "svu release tag to install."
+    required: false
+    default: "v3.2.2"
+
+outputs:
+  version:
+    description: "Computed next version without prefix (e.g. 1.2.3)."
+    value: ${{ steps.main.outputs.version }}
+  tag:
+    description: "Computed tag with prefix (e.g. v1.2.3)."
+    value: ${{ steps.main.outputs.tag }}
+  pr-number:
+    description: "PR number of the opened or updated release PR. Empty when skipped=true."
+    value: ${{ steps.main.outputs.pr-number }}
+  pr-url:
+    description: "HTML URL of the release PR. Empty when skipped=true."
+    value: ${{ steps.main.outputs.pr-url }}
+  created:
+    description: "true if the PR was newly opened by this run; false if an existing PR was updated."
+    value: ${{ steps.main.outputs.created }}
+  skipped:
+    description: "true if HEAD matches the last tag (no commits to release) or the manifest is already at the computed version."
+    value: ${{ steps.main.outputs.skipped }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout at triggering commit
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+        token: ${{ inputs.token }}
+
+    - name: Install svu
+      shell: bash
+      env:
+        SVU_VERSION: ${{ inputs.svu-version }}
+      run: |
+        set -Eeuo pipefail
+
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)   SUFFIX="linux_amd64" ;;
+          Linux-ARM64) SUFFIX="linux_arm64" ;;
+          macOS-X64)   SUFFIX="darwin_amd64" ;;
+          macOS-ARM64) SUFFIX="darwin_arm64" ;;
+          *)
+            echo "::error::Unsupported runner: ${RUNNER_OS}-${RUNNER_ARCH}. Use ubuntu-latest or macos-latest."
+            exit 1
+            ;;
+        esac
+
+        VERSION_NUM="${SVU_VERSION#v}"
+        BASE="https://github.com/caarlos0/svu/releases/download/${SVU_VERSION}"
+        ARCHIVE="svu_${VERSION_NUM}_${SUFFIX}.tar.gz"
+
+        WORKDIR=$(mktemp -d)
+        cd "$WORKDIR"
+
+        curl -fsSL -o "$ARCHIVE" "${BASE}/${ARCHIVE}"
+        curl -fsSL -o checksums.txt "${BASE}/checksums.txt"
+
+        sha256sum --ignore-missing -c checksums.txt
+
+        tar -xzf "$ARCHIVE"
+        sudo install -m 0755 svu /usr/local/bin/svu
+
+        svu --version
+
+    - name: Open or update release PR
+      id: main
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        MANIFEST_PATH: ${{ inputs.manifest-path }}
+        MANIFEST_KEY: ${{ inputs.manifest-key }}
+        BUMP: ${{ inputs.bump }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        PR_LABEL: ${{ inputs.pr-label }}
+        PR_TITLE_TEMPLATE: ${{ inputs.pr-title-template }}
+        PR_BODY_TEMPLATE: ${{ inputs.pr-body-template }}
+        COMMITTER_NAME: ${{ inputs.committer-name }}
+        COMMITTER_EMAIL: ${{ inputs.committer-email }}
+      run: |
+        set -Eeuo pipefail
+
+        REPO="${GITHUB_REPOSITORY}"
+
+        emit_skip() {
+          local version="${1:-}"
+          local tag="${2:-}"
+          {
+            echo "skipped=true"
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "pr-number="
+            echo "pr-url="
+            echo "created=false"
+          } >> "$GITHUB_OUTPUT"
+        }
+
+        # --- Locate the last tag matching the configured prefix ---
+        LAST_TAG=$(git tag -l "${TAG_PREFIX}*" --sort=-v:refname | head -n1 || true)
+        if [ -z "$LAST_TAG" ]; then
+          LAST_TAG="${TAG_PREFIX}0.0.0"
+          echo "No prior tags with prefix '${TAG_PREFIX}'; seeding computation at ${LAST_TAG}."
+          HAS_PRIOR_TAG=false
+        else
+          echo "Last tag: ${LAST_TAG}"
+          HAS_PRIOR_TAG=true
+        fi
+
+        # --- Short-circuit if no commits since last tag ---
+        if [ "$HAS_PRIOR_TAG" = "true" ]; then
+          COMMIT_COUNT=$(git rev-list "${LAST_TAG}..HEAD" --count)
+          if [ "$COMMIT_COUNT" = "0" ]; then
+            echo "No commits since ${LAST_TAG}; nothing to release."
+            emit_skip
+            exit 0
+          fi
+        fi
+
+        # --- Compute next version via svu ---
+        # We let svu use its default "v" prefix internally and translate to the
+        # user-configured tag-prefix below; tag-prefix other than "v" is
+        # supported but requires existing tags to match.
+        case "$BUMP" in
+          auto)              SVU_OUT=$(svu next) ;;
+          major|minor|patch) SVU_OUT=$(svu "$BUMP") ;;
+          *)
+            echo "::error::Invalid bump input: '${BUMP}'. Expected one of: auto, major, minor, patch."
+            exit 1
+            ;;
+        esac
+
+        NEXT_VERSION="${SVU_OUT#v}"
+        NEXT_TAG="${TAG_PREFIX}${NEXT_VERSION}"
+        echo "Computed next version: ${NEXT_VERSION} (tag: ${NEXT_TAG})"
+
+        # --- Verify manifest file + key ---
+        if [ ! -f "$MANIFEST_PATH" ]; then
+          echo "::error::Manifest file not found at '${MANIFEST_PATH}'."
+          exit 1
+        fi
+
+        CURRENT_VERSION=$(jq -r --arg key "$MANIFEST_KEY" '.[$key] // empty' "$MANIFEST_PATH")
+        if [ -z "$CURRENT_VERSION" ]; then
+          echo "::error::Key '${MANIFEST_KEY}' not found in ${MANIFEST_PATH}."
+          exit 1
+        fi
+        echo "Current manifest version: ${CURRENT_VERSION}"
+
+        if [ "$CURRENT_VERSION" = "$NEXT_VERSION" ]; then
+          echo "Manifest already at ${NEXT_VERSION}; nothing to do."
+          emit_skip "$NEXT_VERSION" "$NEXT_TAG"
+          exit 0
+        fi
+
+        BRANCH="${BRANCH_PREFIX}${NEXT_VERSION}"
+
+        # --- Close any stale release PRs (different target version) ---
+        STALE_NUMBERS=$(gh pr list --repo "$REPO" --label "$PR_LABEL" --state open \
+          --json number,headRefName \
+          --jq '.[] | select(.headRefName != "'"$BRANCH"'") | .number' || true)
+        for pr_num in $STALE_NUMBERS; do
+          old_head=$(gh pr view "$pr_num" --repo "$REPO" --json headRefName --jq '.headRefName')
+          echo "Closing stale release PR #${pr_num} (branch ${old_head})"
+          gh pr close "$pr_num" --repo "$REPO" --comment "Superseded by release PR for ${NEXT_TAG}." || true
+          gh api "repos/${REPO}/git/refs/heads/${old_head}" -X DELETE >/dev/null 2>&1 || true
+        done
+
+        # --- Ensure the label exists ---
+        if ! gh label list --repo "$REPO" --json name --jq '.[].name' | grep -qx "$PR_LABEL"; then
+          gh label create "$PR_LABEL" --repo "$REPO" \
+            --color "0366d6" \
+            --description "Automated release PR maintained by skaphos/actions" || true
+        fi
+
+        # --- Reset release branch to default-branch HEAD ---
+        DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch')
+        BASE_SHA=$(gh api "repos/${REPO}/git/ref/heads/${DEFAULT_BRANCH}" --jq '.object.sha')
+
+        if gh api "repos/${REPO}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+          echo "Resetting existing branch ${BRANCH} to ${BASE_SHA}"
+          gh api "repos/${REPO}/git/refs/heads/${BRANCH}" \
+            --method PATCH \
+            -f sha="${BASE_SHA}" \
+            -F force=true >/dev/null
+        else
+          echo "Creating branch ${BRANCH} at ${BASE_SHA}"
+          gh api "repos/${REPO}/git/refs" \
+            --method POST \
+            -f "ref=refs/heads/${BRANCH}" \
+            -f "sha=${BASE_SHA}" >/dev/null
+        fi
+
+        # --- Build new manifest content + commit via Contents API ---
+        NEW_MANIFEST=$(jq --arg key "$MANIFEST_KEY" --arg ver "$NEXT_VERSION" '.[$key] = $ver' "$MANIFEST_PATH")
+        NEW_CONTENT_B64=$(printf '%s\n' "$NEW_MANIFEST" | base64 -w0)
+
+        CURRENT_FILE_SHA=$(gh api "repos/${REPO}/contents/${MANIFEST_PATH}?ref=${BRANCH}" --jq '.sha')
+
+        COMMIT_MSG="chore(release): bump ${MANIFEST_KEY} to ${NEXT_VERSION}
+
+        Automated release PR. Merge to push tag ${NEXT_TAG} and trigger the
+        downstream release pipeline.
+
+        Signed-off-by: ${COMMITTER_NAME} <${COMMITTER_EMAIL}>"
+
+        gh api "repos/${REPO}/contents/${MANIFEST_PATH}" \
+          --method PUT \
+          -f "message=${COMMIT_MSG}" \
+          -f "content=${NEW_CONTENT_B64}" \
+          -f "sha=${CURRENT_FILE_SHA}" \
+          -f "branch=${BRANCH}" \
+          -f "committer[name]=${COMMITTER_NAME}" \
+          -f "committer[email]=${COMMITTER_EMAIL}" \
+          -f "author[name]=${COMMITTER_NAME}" \
+          -f "author[email]=${COMMITTER_EMAIL}" >/dev/null
+        echo "Committed manifest bump on ${BRANCH} (verified via Contents API)."
+
+        # --- Render templates ---
+        render() {
+          local tpl="$1"
+          tpl="${tpl//\{\{tag\}\}/$NEXT_TAG}"
+          tpl="${tpl//\{\{version\}\}/$NEXT_VERSION}"
+          tpl="${tpl//\{\{manifest-key\}\}/$MANIFEST_KEY}"
+          printf '%s' "$tpl"
+        }
+
+        PR_TITLE=$(render "$PR_TITLE_TEMPLATE")
+
+        if [ -z "$PR_BODY_TEMPLATE" ]; then
+          BODY_FILE=$(mktemp)
+          {
+            echo "## Release ${NEXT_TAG}"
+            echo ""
+            echo "Bumps \`${MANIFEST_PATH}\` (\`${MANIFEST_KEY}\`): \`${CURRENT_VERSION}\` → \`${NEXT_VERSION}\`."
+            echo ""
+            echo "### Commits since ${LAST_TAG}"
+            echo ""
+            if [ "$HAS_PRIOR_TAG" = "true" ]; then
+              git log "${LAST_TAG}..HEAD" --pretty=format:'- %s (%h)' | head -n 100
+            else
+              git log HEAD --pretty=format:'- %s (%h)' | head -n 100
+            fi
+            echo ""
+            echo ""
+            echo "---"
+            echo ""
+            echo "Merging this PR will push tag \`${NEXT_TAG}\` and trigger your release pipeline."
+            echo ""
+            echo "_Generated by [skaphos/actions](https://github.com/skaphos/actions)._"
+          } > "$BODY_FILE"
+          PR_BODY=$(cat "$BODY_FILE")
+        else
+          PR_BODY=$(render "$PR_BODY_TEMPLATE")
+        fi
+
+        # --- Open or update PR ---
+        EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+        if [ -n "$EXISTING_PR" ]; then
+          echo "Updating existing PR #${EXISTING_PR}"
+          gh pr edit "$EXISTING_PR" --repo "$REPO" --title "$PR_TITLE" --body "$PR_BODY" --add-label "$PR_LABEL" >/dev/null
+          PR_NUMBER="$EXISTING_PR"
+          CREATED=false
+        else
+          echo "Opening new release PR"
+          gh pr create --repo "$REPO" \
+            --head "$BRANCH" \
+            --base "$DEFAULT_BRANCH" \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY" \
+            --label "$PR_LABEL" >/dev/null
+          PR_NUMBER=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number')
+          CREATED=true
+        fi
+
+        PR_URL=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json url --jq '.url')
+
+        {
+          echo "skipped=false"
+          echo "version=${NEXT_VERSION}"
+          echo "tag=${NEXT_TAG}"
+          echo "pr-number=${PR_NUMBER}"
+          echo "pr-url=${PR_URL}"
+          echo "created=${CREATED}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Done. PR #${PR_NUMBER} at ${PR_URL} (created=${CREATED})."
