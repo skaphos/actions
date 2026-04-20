@@ -79,8 +79,19 @@ jobs:
       - name: Run shellcheck
         run: |
           set -Eeuo pipefail
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}/.shellcheck:/work" \
-            -w /work \
-            koalaman/shellcheck:stable \
-            --severity=warning --shell=bash ./*.sh
+          shopt -s nullglob
+          scripts=(.shellcheck/*.sh)
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "::error::No extracted shell scripts found — the Extract step must run first."
+            exit 1
+          fi
+          for script in "${scripts[@]}"; do
+            name=$(basename "${script}")
+            echo "::group::shellcheck ${name}"
+            docker run --rm \
+              -v "${GITHUB_WORKSPACE}/.shellcheck:/work" \
+              -w /work \
+              koalaman/shellcheck:stable \
+              --severity=warning --shell=bash "${name}"
+            echo "::endgroup::"
+          done
