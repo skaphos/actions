@@ -83,14 +83,19 @@ runs:
         echo "Target tag: ${TAG}"
 
         # --- Short-circuit if tag already exists at the correct SHA ---
-        EXISTING=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.sha' 2>/dev/null || true)
-        if [ -n "$EXISTING" ]; then
+        # gh api writes the JSON error body to stdout (not stderr) on a non-2xx
+        # response, so a missing tag's 404 body would be captured as if it were a
+        # SHA. Gate on the command's exit status instead: a successful fetch means
+        # the ref exists, a failure (404) means it does not and we fall through to
+        # create it.
+        if REF_JSON=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" 2>/dev/null); then
           # Resolve tag object to its target commit if annotated
-          EXISTING_TYPE=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.type' 2>/dev/null || echo "commit")
+          EXISTING_TYPE=$(printf '%s' "$REF_JSON" | jq -r '.object.type')
+          EXISTING_SHA=$(printf '%s' "$REF_JSON" | jq -r '.object.sha')
           if [ "$EXISTING_TYPE" = "tag" ]; then
-            TARGET_SHA=$(gh api "repos/${REPO}/git/tags/${EXISTING}" --jq '.object.sha')
+            TARGET_SHA=$(gh api "repos/${REPO}/git/tags/${EXISTING_SHA}" --jq '.object.sha')
           else
-            TARGET_SHA="$EXISTING"
+            TARGET_SHA="$EXISTING_SHA"
           fi
           if [ "$TARGET_SHA" = "$MERGE_SHA" ]; then
             echo "Tag ${TAG} already points at ${MERGE_SHA}; nothing to do."
