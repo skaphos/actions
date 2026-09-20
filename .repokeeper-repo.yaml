@@ -1,0 +1,11 @@
+apiVersion: repokeeper/v1
+kind: RepoMetadata
+repo_id: github.com/skaphos/actions
+name: Skaphos Actions
+labels:
+    kind: automation
+    org: skaphos
+    role: github-actions
+    tool: actions
+entrypoints:
+    readme: README.md
